@@ -89,7 +89,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_create_database` | Create a new empty `.accdb` database file |
-| `access_close` | Close the COM session and release the `.accdb` file |
+| `access_close` | Release MCP COM references; quit Access only when MCP created the instance |
 
 ### Database objects
 
@@ -264,7 +264,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 2. access_vbe_module_info   → get procedure list and line numbers
 3. access_vbe_get_proc      → read the specific procedure
 4. access_vbe_replace_lines → apply targeted line-level changes
-5. access_close             → release the file when done
+5. access_close             → release MCP COM references; quits Access only when MCP created it
 ```
 
 ### Full object replacement (forms, reports, modules)
@@ -298,7 +298,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 ## Notes
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
-- One Access instance is shared across all tool calls (singleton session). Opening a different `.accdb` closes the previous one.
+- One Access instance is shared across all tool calls (singleton session). A database opened in an MCP-created instance can be switched; an attached user-owned instance is never switched or closed by MCP. If the attached instance has no database open, MCP may open the requested database in it and intentionally leaves it open on disconnect.
+- For an MCP-created instance, `access_close` releases cached child COM proxies, requests `Application.Quit`, and waits up to 10 seconds for the Access process to exit. A timeout is reported but Access is never force-killed.
 - **COM thread isolation**: All COM calls run in a dedicated single-thread executor (`_com_executor`) with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free for stdio I/O, preventing `-32602` errors from message corruption.
 - **Auto-reconnect**: if the COM session becomes stale (Access crashed, closed manually, or COM corruption), the server detects it via a health check and reconnects automatically on the next tool call.
 - `access_get_code` strips binary sections (`PrtMip`, `PrtDevMode`, etc.) from form/report exports — `access_set_code` restores them automatically before importing.

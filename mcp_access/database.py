@@ -39,16 +39,29 @@ def ac_create_database(db_path: str) -> dict:
         raise FileExistsError(
             f"'{resolved}' already exists. Use access_execute_sql to modify it."
         )
-    # Ensure Access is running
+    # Database creation must use an MCP-owned Access instance.
     if _Session._app is None:
-        _Session._launch()
+        _Session._launch_owned()
+    elif not _Session._owns_app:
+        raise RuntimeError(
+            "access_create_database requires an Access instance created by MCP; "
+            "it will not create a database inside a user-owned instance."
+        )
     app = _Session._app
-    # Close any previously open DB
-    if _Session._db_open is not None:
+    current = _Session._current_database_path()
+    _Session._db_open = current
+    if current is not None:
+        _Session._clear_object_caches()
         try:
             app.CloseCurrentDatabase()
-        except Exception:
-            pass
+        except Exception as exc:
+            raise RuntimeError(
+                f"Could not close the current database before creating {resolved}: {exc}"
+            ) from exc
+        if _Session._current_database_path() is not None:
+            raise RuntimeError(
+                f"Access did not close the current database before creating {resolved}."
+            )
         _Session._db_open = None
     try:
         app.NewCurrentDatabase(resolved)

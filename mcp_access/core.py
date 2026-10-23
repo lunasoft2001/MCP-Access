@@ -4,7 +4,6 @@ All other modules import shared state from here.
 """
 
 import asyncio
-import atexit
 import concurrent.futures
 import ctypes
 import logging
@@ -65,6 +64,7 @@ AC_TYPE: dict[str, int] = {
 # ---------------------------------------------------------------------------
 _vbe_code_cache: dict = {}        # "type:name" -> full text of VBE module
 _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_controls() result
+_OWNED_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 # ---------------------------------------------------------------------------
 # COM Session -- singleton, keeps Access alive between calls
@@ -72,10 +72,15 @@ _parsed_controls_cache: dict = {} # "form:name" / "report:name" -> _parse_contro
 class _Session:
     """
     Maintains a single Access.Application instance across tool calls.
-    If a different DB is requested, closes the current one and opens the new one.
+    An attached user instance is never closed or switched to another database.
+    If that instance has no database open, MCP may open the requested database
+    in it and leaves that database open when the session disconnects.
+    An instance created by MCP can be switched and closed.
     """
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
+    _owns_app: bool = False
+    _app_pid: Optional[int] = None
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
 
@@ -91,19 +96,43 @@ class _Session:
                 cls._force_cleanup()
         if cls._app is None:
             cls._launch()
-        if cls._db_open != resolved:
+        current = cls._current_database_path()
+        cls._db_open = current
+        if not cls._paths_equal(current, resolved):
             cls._switch(resolved)
         return cls._app
 
     @classmethod
     def _force_cleanup(cls):
         """Reset state without calling methods on a dead COM object."""
+        cls._clear_object_caches()
         cls._app = None
         cls._db_open = None
-        cls._cm_cache.clear()
+        cls._owns_app = False
+        cls._app_pid = None
         cls._decompiled_dbs.clear()
+
+    @classmethod
+    def _clear_object_caches(cls) -> None:
+        cls._cm_cache.clear()
         _vbe_code_cache.clear()
         _parsed_controls_cache.clear()
+
+    @staticmethod
+    def _paths_equal(left: Optional[str], right: Optional[str]) -> bool:
+        if not left or not right:
+            return left == right
+        return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+    @classmethod
+    def _current_database_path(cls) -> Optional[str]:
+        if cls._app is None:
+            return None
+        try:
+            current = str(cls._app.CurrentProject.FullName or "").strip()
+            return str(Path(current).resolve()) if current else None
+        except Exception:
+            return None
 
     @classmethod
     def _launch(cls) -> None:
@@ -118,25 +147,54 @@ class _Session:
         # for interactive debugging). Fall back to DispatchEx only when none
         # is running — DispatchEx remains required after /decompile kills to
         # bypass stale ROT entries, but in that path no live instance exists.
+        if not cls._try_attach_active():
+            cls._launch_owned()
+
+    @classmethod
+    def _try_attach_active(cls) -> bool:
         try:
+            import win32com.client
+
             cls._app = win32com.client.GetActiveObject("Access.Application")
-            log.info("Attached to existing Access.Application instance")
-            try:
-                current_db = cls._app.CurrentDb()
-                db_name = current_db.Name if current_db is not None else None
-                cls._db_open = str(Path(db_name).resolve()) if db_name else None
-                if cls._db_open:
-                    log.info("Existing Access has DB open: %s", cls._db_open)
-            except Exception:
-                cls._db_open = None
         except Exception:
+            cls._app = None
+            cls._db_open = None
+            cls._owns_app = False
+            cls._app_pid = None
+            return False
+        cls._owns_app = False
+        cls._app_pid = cls._get_access_process_id(cls._app)
+        log.info("Attached to existing Access.Application instance")
+        cls._db_open = cls._current_database_path()
+        if cls._db_open:
+            log.info("Existing Access has DB open: %s", cls._db_open)
+        return True
+
+    @classmethod
+    def _launch_owned(cls) -> None:
+        try:
+            import win32com.client
+        except ImportError:
+            raise RuntimeError(
+                "pywin32 not installed. Run: pip install pywin32"
+            )
+        try:
             log.info("Launching new Access.Application...")
             cls._app = win32com.client.DispatchEx("Access.Application")
-            log.info("Access launched OK")
-        try:
+            cls._owns_app = True
             cls._app.Visible = True   # required for VBE to be accessible via COM
-        except Exception as e:
-            log.warning("Could not set Visible=True: %s (continuing anyway)", e)
+            cls._app_pid = cls._get_access_process_id(cls._app)
+            cls._db_open = cls._current_database_path()
+            log.info("Access launched OK (PID=%s)", cls._app_pid or "unknown")
+        except Exception as exc:
+            app = cls._app
+            if app is not None and cls._owns_app:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            cls._force_cleanup()
+            raise RuntimeError(f"Could not start Microsoft Access: {exc}") from exc
 
     @classmethod
     def reopen(cls, path: str) -> None:
@@ -159,23 +217,28 @@ class _Session:
             cls._decompiled_dbs.add(path)  # don't retry
             return
 
-        # Close COM session completely so the file is unlocked
+        if cls._app is None:
+            cls._try_attach_active()
+        if cls._app is not None and not cls._owns_app:
+            log.warning(
+                "Skipping automatic /decompile because Access is user-owned: %s",
+                path,
+            )
+            cls._decompiled_dbs.add(path)
+            return
+
+        # Close the owned COM session completely so the file is unlocked
         if cls._app is not None:
             log.info("Closing COM session for /decompile...")
-            try:
-                if cls._db_open:
-                    cls._app.CloseCurrentDatabase()
-            except Exception:
-                pass
+            cls._clear_object_caches()
             try:
                 cls._app.Quit(1)  # acQuitSaveNone
             except Exception:
                 pass
             cls._app = None
             cls._db_open = None
-            cls._cm_cache.clear()
-            _vbe_code_cache.clear()
-            _parsed_controls_cache.clear()
+            cls._owns_app = False
+            cls._app_pid = None
 
         log.info("Decompiling %s ...", path)
 
@@ -234,8 +297,8 @@ class _Session:
         cls._decompiled_dbs.add(path)
         log.info("Decompile done for %s", path)
 
-        # Re-launch COM (was killed above)
-        cls._launch()
+        # Re-launch a dedicated instance; do not attach to another user instance.
+        cls._launch_owned()
 
     @staticmethod
     def _suppress_recovery_dialog() -> None:
@@ -257,12 +320,26 @@ class _Session:
         if not os.path.isfile(path):
             raise FileNotFoundError(f"File not found: {path}")
 
-        if cls._db_open is not None:
-            log.info("Closing previous DB: %s", cls._db_open)
+        current = cls._current_database_path()
+        if cls._paths_equal(current, path):
+            cls._db_open = current
+            return
+
+        if current is not None:
+            if not cls._owns_app:
+                raise RuntimeError(
+                    "The attached Access instance already has a different database open "
+                    f"({current}). It will not be closed to open {path}."
+                )
+            log.info("Closing previous DB: %s", current)
+            cls._clear_object_caches()
             try:
                 cls._app.CloseCurrentDatabase()
             except Exception as e:
-                log.warning("Error closing previous DB: %s", e)
+                raise RuntimeError(f"Could not close the current database ({current}): {e}") from e
+            still_open = cls._current_database_path()
+            if still_open is not None:
+                raise RuntimeError(f"Access did not close the current database: {still_open}")
         log.info("Opening DB: %s", path)
 
         cls._suppress_recovery_dialog()
@@ -331,9 +408,8 @@ class _Session:
         try:
             cls._app.OpenCurrentDatabase(path)
         except Exception as e:
-            if "already have the database open" in str(e).lower():
-                log.info("DB was already open — syncing state")
-            else:
+            actual = cls._current_database_path()
+            if "already have the database open" not in str(e).lower() or not cls._paths_equal(actual, path):
                 raise
         finally:
             _open_done.set()  # signal watchdog to stop
@@ -352,7 +428,13 @@ class _Session:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",
                         _dialog_screenshots[0])
 
-        cls._db_open = path
+        actual = cls._current_database_path()
+        if not cls._paths_equal(actual, path):
+            raise RuntimeError(
+                f"Access did not open the requested database. Requested: {path}; "
+                f"current: {actual or '(none)'}"
+            )
+        cls._db_open = actual
 
         # Close any auto-opened forms (safety net)
         try:
@@ -367,32 +449,158 @@ class _Session:
             pass
 
         # Clear caches on DB switch
-        cls._cm_cache.clear()
-        _vbe_code_cache.clear()
-        _parsed_controls_cache.clear()
+        cls._clear_object_caches()
         log.info("DB opened OK")
 
+    @staticmethod
+    def _get_access_process_id(app: Any) -> Optional[int]:
+        try:
+            import win32process
+
+            hwnd_value = app.hWndAccessApp
+            hwnd = int(hwnd_value() if callable(hwnd_value) else hwnd_value)
+            if not hwnd:
+                return None
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            return int(pid) if pid else None
+        except Exception as exc:
+            log.warning("Could not determine Access process ID: %s", exc)
+            return None
+
+    @staticmethod
+    def _wait_for_process_exit(pid: int, timeout_seconds: float) -> Optional[bool]:
+        """Wait for a process while continuing to pump the COM STA message queue."""
+        from ctypes import wintypes
+
+        import pythoncom
+
+        synchronize = 0x00100000
+        wait_object_0 = 0
+        wait_timeout = 258
+        wait_failed = 0xFFFFFFFF
+        error_invalid_parameter = 87
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+
+        process_handle = kernel32.OpenProcess(synchronize, False, pid)
+        if not process_handle:
+            error = ctypes.get_last_error()
+            if error == error_invalid_parameter:
+                return True
+            log.warning("Could not open Access PID %s for shutdown verification (error=%s)", pid, error)
+            return None
+
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait_ms = min(100, max(1, int(remaining * 1000)))
+                result = kernel32.WaitForSingleObject(process_handle, wait_ms)
+                if result == wait_object_0:
+                    return True
+                if result == wait_failed:
+                    log.warning(
+                        "Could not wait for Access PID %s (error=%s)",
+                        pid,
+                        ctypes.get_last_error(),
+                    )
+                    return None
+                if result != wait_timeout:
+                    log.warning("Unexpected wait result for Access PID %s: %s", pid, result)
+                    return None
+                pythoncom.PumpWaitingMessages()
+        finally:
+            kernel32.CloseHandle(process_handle)
+
     @classmethod
-    def quit(cls) -> None:
-        if cls._app is not None:
-            log.info("Closing Access...")
-            try:
-                if cls._db_open:
-                    cls._app.CloseCurrentDatabase()
-                cls._app.Quit()
-                log.info("Access closed OK")
-            except Exception as e:
-                log.warning("Error closing Access: %s", e)
-            finally:
-                cls._app = None
-                cls._db_open = None
-                cls._cm_cache.clear()
-                cls._decompiled_dbs.clear()
-                _vbe_code_cache.clear()
-                _parsed_controls_cache.clear()
+    def quit(cls, suppress_errors: bool = False) -> str:
+        if cls._app is None:
+            cls._force_cleanup()
+            return "No active Access session."
+
+        app = cls._app
+        owns_app = cls._owns_app
+        pid = (cls._app_pid or cls._get_access_process_id(app)) if owns_app else None
+        cls._clear_object_caches()
+
+        if not owns_app:
+            log.info("Releasing attached COM session without closing Access...")
+            cls._app = None
+            cls._db_open = None
+            cls._owns_app = False
+            cls._app_pid = None
+            cls._decompiled_dbs.clear()
+            app = None
+            return "COM session released; the attached Access instance remains open."
+
+        quit_error = None
+        try:
+            log.info("Requesting shutdown of the MCP-owned Access instance...")
+            app.Quit()
+        except Exception as exc:
+            quit_error = exc
+        finally:
+            cls._app = None
+            cls._db_open = None
+            cls._owns_app = False
+            cls._app_pid = None
+            cls._decompiled_dbs.clear()
+            app = None
+
+        if quit_error is not None:
+            log.warning("Error closing Access: %s", quit_error)
+            message = f"Could not close the MCP-owned Access instance: {quit_error}"
+            if not suppress_errors:
+                raise RuntimeError(message) from quit_error
+            return message
+
+        if pid is None:
+            message = (
+                "Shutdown requested for the Access instance created by MCP; "
+                "process exit could not be verified because its PID was unavailable."
+            )
+            log.warning(message)
+            return message
+
+        exited = cls._wait_for_process_exit(pid, _OWNED_SHUTDOWN_TIMEOUT_SECONDS)
+        if exited is True:
+            return f"The Access instance created by MCP exited successfully (PID {pid})."
+        if exited is None:
+            message = (
+                f"Shutdown requested for the Access instance created by MCP (PID {pid}), "
+                "but process exit could not be verified."
+            )
+            log.warning(message)
+            return message
+
+        message = (
+            f"Shutdown timed out: Access PID {pid} did not exit within "
+            f"{_OWNED_SHUTDOWN_TIMEOUT_SECONDS:g} seconds."
+        )
+        log.warning(message)
+        if not suppress_errors:
+            raise RuntimeError(message)
+        return message
 
 
-atexit.register(_Session.quit)
+def shutdown_com_thread() -> str:
+    """Release the Access session and COM apartment on the COM worker thread."""
+    try:
+        return _Session.quit(suppress_errors=True)
+    finally:
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except Exception as exc:
+            log.warning("Could not uninitialize COM worker thread: %s", exc)
 
 
 def _get_vb_project(app):

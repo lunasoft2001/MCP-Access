@@ -91,8 +91,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             )
 
         elif name == "access_close":
-            _Session.quit()
-            text = "Access session closed successfully."
+            text = _Session.quit()
 
         # -- VBE line-level -----------------------------------------------
         elif name == "access_vbe_get_lines":

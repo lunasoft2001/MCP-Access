@@ -73,6 +73,13 @@ def _compact_with_watchdog(app, src: str, dst: str) -> None:
 def ac_compact_repair(db_path: str) -> dict:
     """Compacts and repairs the database. Closes, compacts to temp, replaces and reopens."""
     resolved = str(Path(db_path).resolve())
+    if _Session._app is None:
+        _Session._launch_owned()
+    elif not _Session._owns_app:
+        raise RuntimeError(
+            "access_compact_repair requires an Access instance created by MCP; "
+            "it will not close a user-owned database."
+        )
     app = _Session.connect(resolved)
     original_size = os.path.getsize(resolved)
 
@@ -164,22 +171,27 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     # 1. Close COM session and release the file completely
     try:
+        if _Session._app is None:
+            _Session._launch_owned()
+        elif not _Session._owns_app:
+            raise RuntimeError(
+                "access_decompile_compact requires an Access instance created by MCP; "
+                "it will not close a user-owned Access instance."
+            )
         app = _Session.connect(resolved)
-        try:
-            app.CloseCurrentDatabase()
-        except Exception:
-            pass
-        _Session._db_open = None
-        _Session._cm_cache.clear()
-        _vbe_code_cache.clear()
-        _parsed_controls_cache.clear()
+        _Session._clear_object_caches()
         try:
             app.Quit(1)  # acQuitSaveNone=1
         except Exception:
             pass
         _Session._app = None
+        _Session._db_open = None
+        _Session._owns_app = False
+        _Session._app_pid = None
+    except RuntimeError:
+        raise
     except Exception:
-        pass  # si no habia sesion abierta, continuar igualmente
+        _Session._force_cleanup()
 
     # 2. Lanzar MSACCESS /decompile
     msaccess_candidates = [
@@ -244,8 +256,10 @@ def ac_decompile_compact(db_path: str) -> dict:
 
     decompile_size = os.path.getsize(resolved)
 
-    # 3. Reabrir via COM y recompilar VBA
-    app2 = _Session.connect(resolved)
+    # 3. Reopen in a dedicated COM instance and recompile VBA
+    _Session._launch_owned()
+    _Session._switch(resolved)
+    app2 = _Session._app
     # v0.7.22 BUG FIX: 137 = acCmdNewObjectReport (opens Report Wizard!),
     # NOT acCmdCompileAllModules.  Correct values per Microsoft docs:
     #   acCmdCompileAllModules        = 125

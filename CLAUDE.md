@@ -6,7 +6,8 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 
 ## Architecture
 
-- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Opening a different `.accdb` closes the previous one.
+- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. MCP-owned instances can switch databases and shut down; attached user-owned instances are never switched, closed, or quit by MCP.
+- **Attached empty instance policy**: if user-owned Access has no database open, MCP may open the requested database in it and leaves that database open on disconnect.
 - **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free to read/write stdio.
 - **Caches**: `_vbe_code_cache` (VBE text), `_parsed_controls_cache` (control parsing), `_Session._cm_cache` (CodeModule COM objects). All invalidated on DB switch, object modification, and design operations.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
@@ -140,6 +141,8 @@ Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Appli
 ## Critical DO NOTs
 
 - **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
+- **Do NOT close or quit an attached Access instance**. Only instances created with `_launch_owned()` may switch databases, run destructive maintenance, or receive `Application.Quit`.
+- **Do NOT force-kill Access during normal shutdown**. For an MCP-owned instance, release child COM proxies, call `Quit`, then perform the bounded PID-exit check while pumping STA messages.
 - **Do NOT use `EnsureDispatch`** — it changes binding for all 61 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
